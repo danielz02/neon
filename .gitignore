@@ -982,3 +982,4 @@ _deps
 #   git rm -r .ipynb_checkpoints/
 
 data/
+neon.qgz
