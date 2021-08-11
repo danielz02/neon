@@ -3,9 +3,10 @@ import h5py
 import fiona
 import rasterio
 import numpy as np
+from tqdm import tqdm
 from affine import Affine
+from osgeo import ogr, osr
 from rasterio.crs import CRS
-from pyproj import Transformer
 from collections import namedtuple
 from rasterio.features import bounds
 from fiona.collection import Collection
@@ -56,11 +57,14 @@ class NeonDataset:
 
     def crop_roi(self, shapefile: str, dest_dir: str):
         with fiona.open(shapefile) as shp:
-            trans = Transformer.from_crs(shp.crs["init"], self.crs) \
-                if shp.crs["init"].split(":")[-1] != str(self.crs.to_epsg()) else lambda x, y: (x, y)
-            for feature in shp:
+            for feature in tqdm(shp, total=len(shp)):
                 polygon, *_ = feature["geometry"]["coordinates"]
-                feature["geometry"]["coordinates"] = [[trans.transform(*reversed(x)) for x in polygon]]
+                if shp.crs["init"].split(":")[-1] != str(self.crs.to_epsg()):
+                    feature["geometry"]["coordinates"] = [[
+                        self.coord_trans(
+                            int(shp.crs["init"].split(":")[-1]), self.crs.to_epsg(), *reversed(x)
+                        ) for x in polygon
+                    ]]
                 feat_bounds = bounds(feature)
                 if disjoint_bounds(feat_bounds, self.bounds):
                     continue
@@ -76,11 +80,15 @@ class NeonDataset:
                 feat_meta["height"], feat_meta["width"], feat_meta["count"] = feat_arr.shape
                 feat_meta["transform"] = feat_transform
                 dest_path = os.path.join(
-                    dest_dir, "{}_{}.tif".format(
-                        feature["properties"]["plotID"], os.path.basename(self.path).strip(".h5").strip("NEON_")
+                    dest_dir, "{fid}_{pid}_{name}.tif".format(
+                        fid=str(feature["id"]).zfill(4),
+                        pid=feature["properties"]["plotID"],
+                        name=os.path.basename(self.path).strip(".h5").strip("NEON_")
+                                    .replace("{}_".format(self.site_name), "")
                     )
                 )
                 with rasterio.open(dest_path, "w", **feat_meta) as dest:
+                    dest.update_tags(**feature["properties"])
                     dest.write(feat_arr.transpose(2, 0, 1))
                     for i, wls in enumerate(self.wavelengths):
                         dest.set_band_description(i + 1, "{} {}".format(wls, self.wavelength_units))
@@ -90,7 +98,20 @@ class NeonDataset:
         with rasterio.open(dest_path, "w", **self.raster_meta) as dest:
             dest.write(self.data[()].transpose(2, 0, 1))
             for i, wls in enumerate(self.wavelengths):
-                dest.set_band_description(i + 1, "{} {}".format(wls, self.wavelength_units))
+                dest.set_band_description(i + 1, wls)
+
+    @staticmethod
+    def coord_trans(src_epsg: int, dest_epsg: int, src_x: float, src_y: float):
+        src_sr = osr.SpatialReference()
+        src_sr.ImportFromEPSG(src_epsg)
+        dest_sr = osr.SpatialReference()
+        dest_sr.ImportFromEPSG(dest_epsg)
+
+        point = ogr.Geometry(ogr.wkbPoint)
+        point.AddPoint(src_x, src_y)  # use your coordinates here
+        point.AssignSpatialReference(src_sr)  # tell the point what coordinates it's in
+        point.TransformTo(dest_sr)  # project it to the out spatial reference
+        return point.GetX(), point.GetY()
 
     def __del__(self):
         self.h5.close()
