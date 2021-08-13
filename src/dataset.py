@@ -1,4 +1,5 @@
 import os
+import zlib
 import h5py
 import fiona
 import rasterio
@@ -9,19 +10,20 @@ from osgeo import ogr, osr
 from rasterio.crs import CRS
 from collections import namedtuple
 from rasterio.features import bounds
-from fiona.collection import Collection
 from rasterio.coords import disjoint_bounds
-from rasterio.features import geometry_mask
 from rasterio.windows import from_bounds, transform, intersection
-
 
 Bounds = namedtuple("Bounds", ["left", "bottom", "right", "top"])
 
 
 class NeonDataset:
-    def __init__(self, path: str):
+    def __init__(self, path: str, comm=None):
         self.path = path
-        self.h5 = h5py.File(path, "r")
+        if not comm:
+            self.h5 = h5py.File(path, "r")
+        else:
+            self.comm = comm
+            self.h5 = h5py.File(path, "r", driver="mpio", comm=self.comm)
         self.site_name = list(self.h5.keys())[0]
         self.data = self.h5[self.site_name]["Reflectance"]["Reflectance_Data"]
         self.meta = self.h5[self.site_name]["Reflectance"]["Metadata"]
@@ -62,14 +64,28 @@ class NeonDataset:
                 if shp.crs["init"].split(":")[-1] != str(self.crs.to_epsg()):
                     feature["geometry"]["coordinates"] = [[
                         self.coord_trans(
-                            int(shp.crs["init"].split(":")[-1]), self.crs.to_epsg(), *reversed(x)
+                            int(shp.crs["init"].split(":")[-1]), self.crs.to_epsg(), *x
                         ) for x in polygon
                     ]]
+                dest_path = os.path.join(
+                    dest_dir, "{fid}_{pid}_{name}.tif".format(
+                        fid=str(feature["id"]).zfill(4),
+                        pid=feature["properties"]["plotID"],
+                        name=os.path.basename(self.path).strip(".h5").strip("NEON_")
+                                    .replace("{}_".format(self.site_name), "")
+                    )
+                )
+                if os.path.exists(dest_path):
+                    continue
+                if np.any(np.isinf(feature["geometry"]["coordinates"])):
+                    continue
                 feat_bounds = bounds(feature)
                 if disjoint_bounds(feat_bounds, self.bounds):
                     continue
                 feat_window = from_bounds(*feat_bounds, transform=self.transform)
                 feat_window = intersection(feat_window, from_bounds(*self.bounds, transform=self.transform))
+                if feat_window.height < 1 or feat_window.width < 1:
+                    continue
                 feat_transform = transform(feat_window, self.transform)
                 feat_arr = self.data[
                     int(feat_window.row_off):int(feat_window.row_off + feat_window.height),
@@ -79,19 +95,12 @@ class NeonDataset:
                 feat_meta = self.raster_meta.copy()
                 feat_meta["height"], feat_meta["width"], feat_meta["count"] = feat_arr.shape
                 feat_meta["transform"] = feat_transform
-                dest_path = os.path.join(
-                    dest_dir, "{fid}_{pid}_{name}.tif".format(
-                        fid=str(feature["id"]).zfill(4),
-                        pid=feature["properties"]["plotID"],
-                        name=os.path.basename(self.path).strip(".h5").strip("NEON_")
-                                    .replace("{}_".format(self.site_name), "")
-                    )
-                )
                 with rasterio.open(dest_path, "w", **feat_meta) as dest:
                     dest.update_tags(**feature["properties"])
                     dest.write(feat_arr.transpose(2, 0, 1))
                     for i, wls in enumerate(self.wavelengths):
                         dest.set_band_description(i + 1, "{} {}".format(wls, self.wavelength_units))
+                    print(dest_path)
 
     def to_tiff(self, dest_path: str = None):
         dest_path = self.path.replace(".h5", ".tif") if not dest_path else dest_path
