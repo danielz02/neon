@@ -1,11 +1,16 @@
 import os
 import zlib
+from typing import Optional, List, Tuple
+
 import pandas as pd
 import h5py
 import fiona
+import pytorch_lightning as pl
 import rasterio
 import numpy as np
 import torch
+from pytorch_lightning.utilities.types import TRAIN_DATALOADERS, EVAL_DATALOADERS
+from torch import Tensor
 from tqdm import tqdm
 from affine import Affine
 from osgeo import ogr, osr
@@ -15,7 +20,7 @@ from rasterio.features import bounds
 from rasterio.coords import disjoint_bounds
 from rasterio.windows import from_bounds, transform, intersection
 from sklearn.model_selection import train_test_split
-from torch.utils.data import TensorDataset, random_split, Dataset
+from torch.utils.data import TensorDataset, random_split, Dataset, DataLoader
 
 Bounds = namedtuple("Bounds", ["left", "bottom", "right", "top"])
 
@@ -130,12 +135,16 @@ class NeonDataset:
         self.h5.close()
 
 
-class SpectralDataset(Dataset):
-    def __init__(self, path: str, seq_len: int, target_name: str, scale: float = None, transforms=None, position_encode=False):
+class SpectralDataset(pl.LightningDataModule):
+    def __init__(
+        self, path: str, seq_len: int, target_name: str, batch_size: int = 2048, split_ratios: List[int] = None,
+        scale: float = None, transforms=None, position_encode=False
+    ):
         super().__init__()
         self.scale = scale
         self.seq_len = seq_len
         self.df = pd.read_csv(path)
+        self.batch_size = batch_size
         self.transforms = transforms
         self.target_name = target_name
         self.position_encode = position_encode
@@ -144,10 +153,44 @@ class SpectralDataset(Dataset):
         except:
             print("")
 
+        idx = list(range(len(self.df)))
+        if not split_ratios:
+            self.test_idx = idx
+            self.test_set = TensorDataset(*self.__getitem__(self.test_idx))
+        elif len(split_ratios) == 2:
+            train_ratio, val_ratio = split_ratios
+            self.train_idx, self.val_idx = train_test_split(idx, train_size=train_ratio, test_size=val_ratio)
+            self.train_set = TensorDataset(*self.__getitem__(self.train_idx))
+            self.val_set = TensorDataset(*self.__getitem__(self.val_idx))
+        elif len(split_ratios) == 3:
+            train_ratio, val_ratio, test_ratio = split_ratios
+            train_size, val_size = int(len(self.df) * train_ratio), int(len(self.df) * val_ratio)
+            test_size = len(self.df) - train_size - val_size
+
+            self.train_idx, self.test_idx = train_test_split(idx, train_size + val_size, test_size)
+            self.train_idx, self.val_idx = train_test_split(self.train_idx, train_size, val_size)
+            self.train_set = TensorDataset(*self.__getitem__(self.train_idx))
+            self.val_set = TensorDataset(*self.__getitem__(self.val_idx))
+            self.test_set = TensorDataset(*self.__getitem__(self.test_idx))
+
+        self.save_hyperparameters()
+
+    def train_dataloader(self) -> TRAIN_DATALOADERS:
+        assert self.train_idx
+        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=8)
+
+    def val_dataloader(self) -> EVAL_DATALOADERS:
+        assert self.val_idx
+        return DataLoader(self.val_set, batch_size=self.batch_size, num_workers=8)
+
+    def test_dataloader(self) -> EVAL_DATALOADERS:
+        assert self.test_idx
+        return DataLoader(self.test_set, batch_size=self.batch_size, num_workers=8)
+
     def __len__(self):
         return len(self.df)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx) -> Tuple[Tensor, Tensor]:
         x_tensor = torch.from_numpy(self.df.iloc[idx, :self.seq_len].to_numpy().astype(np.float32))
         y_tensor = torch.tensor(self.df[self.target_name].iloc[idx].astype(np.float32))
         if self.transforms:
