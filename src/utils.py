@@ -2,13 +2,14 @@ import rasterio
 import numpy as np
 import pandas as pd
 from scipy.stats import kde
+import pytorch_lightning as pl
 import matplotlib.pyplot as plt
 from scipy.signal import savgol_filter
 from matplotlib.ticker import MaxNLocator
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 
 
-def des_scatter_plot(y_true: np.ndarray, y_pred: np.ndarray, label_name: str, save_path: str, ax: plt.Axes = None):
+def des_scatter_plot(y_true: np.ndarray, y_pred: np.ndarray, label_name: str, save_path: str = None, ax: plt.Axes = None):
     # assert (save_path is not None and ax is None) or (save_path is None and ax is not None)
     save_fig = ax is None and save_path is not None
 
@@ -29,23 +30,20 @@ def des_scatter_plot(y_true: np.ndarray, y_pred: np.ndarray, label_name: str, sa
     # ax.scatter(x=y_pred, y=y_true, c=colors, s=80, alpha=1)
     # ax.scatter(x=y_pred, y=y_true, s=80, alpha=1, edgecolors="k")
     ax.scatter(x=y_pred, y=y_true, s=80, c=colors, alpha=1)
-    ax.set_title(label_name)
+    # ax.set_title(label_name)
 
     ax.set_xlabel("Predicted Value")
     ax.set_ylabel("Actual Value")
-    txt = f"RMSE = {rmse:.2f} ({(rmse / range_ * 100):.2f}%)\n" \
+    txt = f"n = {len(y_true)}\n" \
+          f"RMSE = {rmse:.2f} ({(rmse / range_ * 100):.2f}%)\n" \
           f"Bias = {bias:.2f} ({(bias / range_ * 100):.2f}%)\n" \
           f"$R^2$ = {r2:.2f}\n"
     # f"MAE = {round(mae, 2)} ({round(mae / y_true.mean() * 100, 2)} %)\n"
-    axis_min, axis_max = max(min(np.min(y_true), np.min(y_pred)), 0), max(np.max(y_true), np.max(y_pred))
+    axis_min, axis_max = 0, max(np.max(y_true), np.max(y_pred))
     # axis_min = max(5 * round(axis_min - np.abs(axis_max - axis_min) * 0.05) / 5, 0)
     # axis_max = 5 * round((axis_max + np.abs(axis_max - axis_min) * 0.3) / 5 + 1)
-    if label_name.lower() == "residue":
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-    else:
-        ax.set_xlim(axis_min, axis_max)
-        ax.set_ylim(axis_min, axis_max)
+    ax.set_xlim(axis_min, axis_max)
+    ax.set_ylim(axis_min, axis_max)
     ax.plot(
         [-1000, 1000],
         [-1000, 1000],
@@ -56,7 +54,7 @@ def des_scatter_plot(y_true: np.ndarray, y_pred: np.ndarray, label_name: str, sa
     locator.view_limits(axis_min, axis_max)
     ya.set_major_locator(locator)
     xa.set_major_locator(locator)
-    ax.annotate(text=txt, xy=(0.02, 0.60), xycoords='axes fraction', color="red")
+    ax.annotate(text=txt, xy=(0.02, 0.70), xycoords='axes fraction', color="red")
     if save_fig:
         plt.savefig(save_path, dpi=500)
     elif not ax:
@@ -83,3 +81,25 @@ def visualize_spectrum(df: pd.DataFrame):
     plt.plot(spec_wls, spec, label="SG")
     plt.legend()
     plt.show()
+
+
+class WandbImageCallback(pl.Callback):
+    """Logs the input and output images of a module.
+
+    Images are stacked into a mosaic, with output on the top
+    and input on the bottom."""
+
+    def __init__(self):
+        super().__init__()
+
+    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        trainer.logger.experiment.log({
+            "val/example": pl_module.ax_val,
+            "global_step": trainer.global_step
+        })
+
+    def on_test_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        trainer.logger.experiment.log({
+            "test/example": pl_module.ax_test,
+            "global_step": trainer.global_step
+        })
