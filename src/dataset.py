@@ -137,7 +137,7 @@ class NeonDataset:
 
 class SpectralDataset(pl.LightningDataModule):
     def __init__(
-        self, path: str, seq_len: int, target_name: str, batch_size: int = 2048, split_ratios: List[int] = None,
+        self, path: str, seq_len: int, target_name: str, batch_size: int = 2048, split_ratios: List[float] = None,
         scale: float = None, transforms=None, position_encode=False
     ):
         super().__init__()
@@ -158,17 +158,17 @@ class SpectralDataset(pl.LightningDataModule):
             self.test_idx = idx
             self.test_set = TensorDataset(*self.__getitem__(self.test_idx))
         elif len(split_ratios) == 2:
-            train_ratio, val_ratio = split_ratios
-            self.train_idx, self.val_idx = train_test_split(idx, train_size=train_ratio, test_size=val_ratio)
+            train_ratio, test_ratio = split_ratios
+            self.train_idx, self.test_idx = train_test_split(idx, train_size=train_ratio, test_size=test_ratio)
             self.train_set = TensorDataset(*self.__getitem__(self.train_idx))
-            self.val_set = TensorDataset(*self.__getitem__(self.val_idx))
+            self.test_set = TensorDataset(*self.__getitem__(self.test_idx))
         elif len(split_ratios) == 3:
             train_ratio, val_ratio, test_ratio = split_ratios
             train_size, val_size = int(len(self.df) * train_ratio), int(len(self.df) * val_ratio)
             test_size = len(self.df) - train_size - val_size
 
-            self.train_idx, self.test_idx = train_test_split(idx, train_size + val_size, test_size)
-            self.train_idx, self.val_idx = train_test_split(self.train_idx, train_size, val_size)
+            self.train_idx, self.test_idx = train_test_split(idx, test_size=test_size, train_size=(train_size + val_size))
+            self.train_idx, self.val_idx = train_test_split(self.train_idx, train_size=train_size, test_size=val_size)
             self.train_set = TensorDataset(*self.__getitem__(self.train_idx))
             self.val_set = TensorDataset(*self.__getitem__(self.val_idx))
             self.test_set = TensorDataset(*self.__getitem__(self.test_idx))
@@ -192,7 +192,7 @@ class SpectralDataset(pl.LightningDataModule):
 
     def __getitem__(self, idx) -> Tuple[Tensor, Tensor]:
         x_tensor = torch.from_numpy(self.df.iloc[idx, :self.seq_len].to_numpy().astype(np.float32))
-        y_tensor = torch.tensor(self.df[self.target_name].iloc[idx].astype(np.float32))
+        y_tensor = torch.tensor(self.df[self.target_name].iloc[idx].to_numpy().astype(np.float32))
         if self.transforms:
             x_tensor = self.transforms(x_tensor)
         if self.scale:
@@ -200,7 +200,7 @@ class SpectralDataset(pl.LightningDataModule):
         if self.position_encode:
             x_tensor = torch.vstack([x_tensor, self.wls]).T
         else:
-            x_tensor = x_tensor.unsqueeze(dim=1)
+            x_tensor = x_tensor.unsqueeze(dim=2)
         return x_tensor, y_tensor
 
 
