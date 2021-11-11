@@ -173,7 +173,7 @@ class SpectralDataset(pl.LightningDataModule):
             self.val_set = TensorDataset(*self.__getitem__(self.val_idx))
             self.test_set = TensorDataset(*self.__getitem__(self.test_idx))
 
-        self.save_hyperparameters()
+        # self.save_hyperparameters()
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
         assert self.train_idx
