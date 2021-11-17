@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import zlib
 from typing import Optional, List, Tuple
@@ -137,8 +139,9 @@ class NeonDataset:
 
 class SpectralDataset(pl.LightningDataModule):
     def __init__(
-        self, path: str, seq_len: int, target_name: str, batch_size: int = 2048, split_ratios: List[float] = None,
-        scale: float = None, transforms=None, position_encode=False
+        self, path: str, seq_len: int, target_name: str | List[str], batch_size: int = 2048,
+        split_ratios: List[float] = None, da_set: str = None, scale: float = None, transforms=None,
+        position_encode=False, manual_splits: List = None
     ):
         super().__init__()
         self.scale = scale
@@ -148,6 +151,14 @@ class SpectralDataset(pl.LightningDataModule):
         self.transforms = transforms
         self.target_name = target_name
         self.position_encode = position_encode
+        if da_set is not None:
+            self.target_domain = pd.read_csv(da_set)
+            self.df["domain"] = 0
+            self.target_domain["domain"] = 1
+            self.df = pd.concat([self.df, self.target_domain], axis=0)
+        else:
+            self.target_domain = None
+
         try:
             self.wls = torch.tensor(self.df.columns[:seq_len].astype(dtype=np.float32), dtype=torch.float32)
         except:
@@ -173,26 +184,45 @@ class SpectralDataset(pl.LightningDataModule):
             self.val_set = TensorDataset(*self.__getitem__(self.val_idx))
             self.test_set = TensorDataset(*self.__getitem__(self.test_idx))
 
+        if manual_splits is not None:
+            self.train_idx, self.val_idx, self.test_idx, self.pred_idx = manual_splits
+            if self.train_idx is not None:
+                self.train_set = TensorDataset(*self.__getitem__(self.train_idx))
+            if self.val_idx is not None:
+                self.val_set = TensorDataset(*self.__getitem__(self.val_idx))
+            if self.test_idx is not None:
+                self.test_set = TensorDataset(*self.__getitem__(self.test_idx))
+            if self.pred_idx is not None:
+                self.pred_set = TensorDataset(*self.__getitem__(self.pred_idx))
+
         # self.save_hyperparameters()
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
-        assert self.train_idx
+        assert self.train_idx is not None
         return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=8)
 
     def val_dataloader(self) -> EVAL_DATALOADERS:
-        assert self.val_idx
+        assert self.val_idx is not None
         return DataLoader(self.val_set, batch_size=self.batch_size, num_workers=8)
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
-        assert self.test_idx
+        assert self.test_idx is not None
         return DataLoader(self.test_set, batch_size=self.batch_size, num_workers=8)
+
+    def predict_dataloader(self) -> EVAL_DATALOADERS:
+        assert self.pred_idx is not None
+        return DataLoader(self.pred_set, batch_size=self.batch_size, num_workers=8)
 
     def __len__(self):
         return len(self.df)
 
-    def __getitem__(self, idx) -> Tuple[Tensor, Tensor]:
+    def __getitem__(self, idx) -> Tuple[Tensor, Tensor, Tensor]:
         x_tensor = torch.from_numpy(self.df.iloc[idx, :self.seq_len].to_numpy().astype(np.float32))
         y_tensor = torch.tensor(self.df[self.target_name].iloc[idx].to_numpy().astype(np.float32))
+        if self.target_domain is not None:
+            domain_tensor = torch.tensor(self.df["domain"].iloc[idx].to_numpy().astype(np.float32))
+        else:
+            domain_tensor = torch.zeros_like(y_tensor) * np.nan
         if self.transforms:
             x_tensor = self.transforms(x_tensor)
         if self.scale:
@@ -201,7 +231,7 @@ class SpectralDataset(pl.LightningDataModule):
             x_tensor = torch.vstack([x_tensor, self.wls]).T
         else:
             x_tensor = x_tensor.unsqueeze(dim=2)
-        return x_tensor, y_tensor
+        return x_tensor, y_tensor, domain_tensor
 
 
 class GaussianNoise(object):
