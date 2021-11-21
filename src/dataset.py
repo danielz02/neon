@@ -207,7 +207,8 @@ class SpectralDataset(pl.LightningDataModule):
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
         assert self.test_idx is not None
-        return DataLoader(self.test_set, batch_size=self.batch_size, num_workers=8)
+        print("Drop Last")
+        return DataLoader(self.test_set, batch_size=self.batch_size, num_workers=8, drop_last=True)
 
     def predict_dataloader(self) -> EVAL_DATALOADERS:
         assert self.pred_idx is not None
@@ -232,6 +233,44 @@ class SpectralDataset(pl.LightningDataModule):
         else:
             x_tensor = x_tensor.unsqueeze(dim=2)
         return x_tensor, y_tensor, domain_tensor
+
+
+class RasterDataset(pl.LightningDataModule):
+    def __init__(self, path: str, scale: float = None, batch_size: int = 2048, nodata: int = None):
+        super().__init__()
+        self.raster = rasterio.open(path)
+        if self.raster.count == 360:
+            self.arr = self.raster.read(range(5, 361))
+        else:
+            self.arr = self.raster.read()
+        self.c, self.h, self.w = self.arr.shape
+
+        if self.raster.dtype is "uint16":
+            scale = 1e-4
+        if nodata:
+            self.nodata = nodata
+        else:
+            self.nodata = self.raster.nodata
+        self.batch_size = batch_size
+
+        self.arr = self.arr.transpose(1, 2, 0).reshape(-1, self.c).astype(np.float32)
+        if scale:
+            self.arr *= self.arr * scale
+
+        self.arr = torch.from_numpy(self.arr)
+        self.dataset = TensorDataset(self.arr)
+
+    def predict_dataloader(self) -> EVAL_DATALOADERS:
+        return DataLoader(self.dataset, batch_size=self.batch_size, num_workers=8)
+
+    def __len__(self) -> int:
+        return self.h * self.w
+
+    def __getitem__(self, idx):
+        return self.arr[idx]
+
+    def __del__(self):
+        self.raster.close()
 
 
 class GaussianNoise(object):
