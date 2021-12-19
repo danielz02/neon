@@ -4,6 +4,7 @@ import os
 import zlib
 from typing import Optional, List, Tuple
 
+import geopandas
 import pandas as pd
 import h5py
 import fiona
@@ -11,7 +12,6 @@ import pytorch_lightning as pl
 import rasterio
 import numpy as np
 import torch
-from pytorch_lightning.utilities.types import TRAIN_DATALOADERS, EVAL_DATALOADERS
 from torch import Tensor
 from tqdm import tqdm
 from affine import Affine
@@ -20,9 +20,11 @@ from rasterio.crs import CRS
 from collections import namedtuple
 from rasterio.features import bounds
 from rasterio.coords import disjoint_bounds
-from rasterio.windows import from_bounds, transform, intersection
 from sklearn.model_selection import train_test_split
+from rasterio.windows import from_bounds, transform, intersection
 from torch.utils.data import TensorDataset, random_split, Dataset, DataLoader
+from pytorch_lightning.utilities.types import TRAIN_DATALOADERS, EVAL_DATALOADERS
+
 
 Bounds = namedtuple("Bounds", ["left", "bottom", "right", "top"])
 
@@ -217,7 +219,7 @@ class SpectralDataset(pl.LightningDataModule):
     def __len__(self):
         return len(self.df)
 
-    def __getitem__(self, idx) -> Tuple[Tensor, Tensor, Tensor]:
+    def __getitem__(self, idx) -> Tuple[Tensor, Tensor, Tensor] | Tuple[Tensor, Tensor]:
         x_tensor = torch.from_numpy(self.df.iloc[idx, :self.seq_len].to_numpy().astype(np.float32))
         y_tensor = torch.tensor(self.df[self.target_name].iloc[idx].to_numpy().astype(np.float32))
         if self.target_domain is not None:
@@ -232,7 +234,10 @@ class SpectralDataset(pl.LightningDataModule):
             x_tensor = torch.vstack([x_tensor, self.wls]).T
         else:
             x_tensor = x_tensor.unsqueeze(dim=2)
-        return x_tensor, y_tensor, domain_tensor
+        if self.target_domain is not None:
+            return x_tensor, y_tensor, domain_tensor
+        else:
+            return x_tensor, y_tensor
 
 
 class RasterDataset(pl.LightningDataModule):
@@ -245,7 +250,7 @@ class RasterDataset(pl.LightningDataModule):
             self.arr = self.raster.read()
         self.c, self.h, self.w = self.arr.shape
 
-        if self.raster.dtype is "uint16":
+        if self.raster.dtype == "uint16":
             scale = 1e-4
         if nodata:
             self.nodata = nodata
@@ -273,6 +278,64 @@ class RasterDataset(pl.LightningDataModule):
         self.raster.close()
 
 
+class IndianaTillage(pl.LightningDataModule):
+    def __init__(self, shp_folder: str, field_spectra: str, attr: str, batch_size: int):
+        super().__init__()
+        self.attr = attr
+        self.batch_size = batch_size
+        self.spectra = pd.read_csv(field_spectra)
+        self.spectra["Year"] = self.spectra["Date"].apply(lambda x: int(x[:4]))
+        self.spectra.sort_values(["Year", "Feature ID", "Date"], inplace=True)
+        self.spectra.set_index(["Year", "Feature ID"], inplace=True)
+
+        shp_fmt = os.path.join(shp_folder, "Indiana_Fall_Transect_Data_V1_{yyyy}_closest.shp")
+        self.shapes = {yr: geopandas.read_file(shp_fmt.format(yyyy=yr)) for yr in range(2017, 2021)}
+        self.labels = set.union(*[set(x[self.attr].unique().tolist()) for _, x in self.shapes.items()])
+        self.label_encodings = {x: i for i, x in enumerate(self.labels)}
+
+        assert sum([len(x) for _, x in self.shapes.items()]) == len(self.spectra.index)
+
+        self.stair_bands = ["blue", "green", "red", "nir", "swir1", "swir2"]
+
+        self.train_size = int(self.__len__() * 0.6)
+        self.val_size = int(self.__len__() * 0.2)
+        self.test_size = self.__len__() - self.train_size - self.val_size
+
+        self.train_idx, self.test_idx = train_test_split(
+            self.spectra.index, test_size=self.test_size, train_size=(self.train_size + self.val_size)
+        )
+        self.train_idx, self.val_idx = train_test_split(
+            self.spectra.index, train_size=self.train_size, test_size=self.val_size
+        )
+
+        self.train_set, self.val_set, self.test_set = [
+            TensorDataset(*self.__getitem__(self.train_idx)),
+            TensorDataset(*self.__getitem__(self.val_idx)),
+            TensorDataset(*self.__getitem__(self.test_idx))
+        ]
+
+        self.save_hyperparameters()
+
+    def train_dataloader(self) -> TRAIN_DATALOADERS:
+        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=8, pin_memory=True)
+
+    def val_dataloader(self) -> EVAL_DATALOADERS:
+        return DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False, num_workers=8, pin_memory=True)
+
+    def test_dataloader(self) -> EVAL_DATALOADERS:
+        return DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=8, pin_memory=True)
+
+    def __len__(self):
+        return len(self.spectra.index)
+
+    def __getitem__(self, idx):
+        yr, fid = self.spectra.index[idx]
+        spectra = torch.from_numpy(self.spectra[self.spectra.index[idx]][self.stair_bands].to_numpy()).float()
+        label = int(self.shapes[yr].loc[fid][self.attr])
+
+        return spectra, label
+
+
 class GaussianNoise(object):
     def __init__(self, std=0.01):
         self.std = std
@@ -283,50 +346,3 @@ class GaussianNoise(object):
         return batch + torch.normal(0, self.std, size=batch.shape)
 
 
-def read_dataset(
-    path: str, target_name: str, seq_len, split_ratio: float = None, scale: float = None,
-        stratify: bool = False
-):
-    """
-    Read any tabular dataset (with the last column being labels) as PyTorch TensorDataset
-    :param stratify: whether to stratify the dataset while splitting
-    :param scale: scale factor for the spectra
-    :param seq_len: the length of the input features
-    :param target_name: the name of the label column in the CSV
-    :param path: path to the csv file
-    :param split_ratio: Train/Validation split ratio
-    :return: Train and validation dataset if split_ratio is define, the entire dataset otherwise
-    """
-    if split_ratio:
-        assert split_ratio >= 0
-        assert split_ratio <= 1
-
-    df = pd.read_csv(path)
-    x_arr = df.iloc[:, :seq_len]
-    y_arr = df[target_name]
-
-    x_tensor = torch.tensor(x_arr.to_numpy(), dtype=torch.float32)
-    if scale:
-        x_tensor *= scale
-    x_tensor = x_tensor.unsqueeze(1)  # Add channel dimension -> (N, C, seq_len)
-    y_tensor = torch.tensor(y_arr, dtype=torch.float32)
-    dataset = TensorDataset(x_tensor, y_tensor)
-
-    if split_ratio:
-        train_size = int(len(dataset) * split_ratio)
-        val_size = len(dataset) - train_size
-        if stratify:
-            bin_edges = np.histogram_bin_edges(y_tensor, bins="auto")
-            print(bin_edges)
-            y_binned = np.digitize(y_tensor, bin_edges, right=True)
-            train_set, val_set = train_test_split(
-                dataset, train_size=train_size, test_size=val_size, random_state=0,
-                shuffle=True, stratify=y_binned
-            )
-        else:
-            train_set, val_set = random_split(
-                dataset=dataset, lengths=[train_size, val_size], generator=torch.manual_seed(0)
-            )
-        return train_set, val_set
-    else:
-        return dataset
