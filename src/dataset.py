@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import zlib
+from glob import glob
 from typing import Optional, List, Tuple
 
 import geopandas
@@ -288,12 +289,14 @@ class IndianaTillage(pl.LightningDataModule):
         self.spectra.sort_values(["Year", "Feature ID", "Date"], inplace=True)
         self.spectra.set_index(["Year", "Feature ID"], inplace=True)
 
-        shp_fmt = os.path.join(shp_folder, "Indiana_Fall_Transect_Data_V1_{yyyy}_closest.shp")
-        self.shapes = {yr: geopandas.read_file(shp_fmt.format(yyyy=yr)) for yr in range(2017, 2021)}
-        self.labels = set.union(*[set(x[self.attr].unique().tolist()) for _, x in self.shapes.items()])
+        p = sorted(glob(os.path.join(shp_folder, "Indiana_Fall_Transect_Data_V1_*_closest.shp")))
+        self.shapes = pd.concat([
+            geopandas.read_file(x).reset_index().rename({"index": "FID"}, axis=1).set_index(["Year", "FID"]) for x in p
+        ])
+        self.labels = self.shapes[self.attr].unique()
         self.label_encodings = {x: i for i, x in enumerate(self.labels)}
 
-        assert sum([len(x) for _, x in self.shapes.items()]) == len(self.spectra.index)
+        assert len(self.shapes.index) == len(self.spectra.index)
 
         self.stair_bands = ["blue", "green", "red", "nir", "swir1", "swir2"]
 
@@ -329,11 +332,16 @@ class IndianaTillage(pl.LightningDataModule):
         return len(self.spectra.index)
 
     def __getitem__(self, idx):
-        yr, fid = self.spectra.index[idx]
-        spectra = torch.from_numpy(self.spectra[self.spectra.index[idx]][self.stair_bands].to_numpy()).float()
-        label = int(self.shapes[yr].loc[fid][self.attr])
+        spectra = self.spectra[self.spectra.index[idx]][self.stair_bands].to_numpy()
+        if isinstance(idx, pd.MultiIndex):
+            spectra = np.vsplit(spectra, len(idx))
+        spectra = torch.from_numpy(spectra).float()
+        if isinstance(idx, pd.MultiIndex):
+            labels = torch.from_numpy(self.shapes[self.attr][idx].replace(self.label_encodings))
+        else:
+            labels = torch.tensor(self.label_encodings[self.shapes[self.attr][idx]])
 
-        return spectra, label
+        return spectra, labels
 
 
 class GaussianNoise(object):
