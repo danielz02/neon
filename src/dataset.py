@@ -279,7 +279,7 @@ class RasterDataset(pl.LightningDataModule):
         self.raster.close()
 
 
-class IndianaTillage(pl.LightningDataModule):
+class IndianaDataset(pl.LightningDataModule):
     def __init__(self, shp_folder: str, field_spectra: str, attr: str, batch_size: int):
         super().__init__()
         self.attr = attr
