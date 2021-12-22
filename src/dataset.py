@@ -6,6 +6,7 @@ from glob import glob
 from typing import Optional, List, Tuple
 
 import geopandas
+import numpy
 import pandas as pd
 import h5py
 import fiona
@@ -202,20 +203,20 @@ class SpectralDataset(pl.LightningDataModule):
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
         assert self.train_idx is not None
-        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=8)
+        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=os.cpu_count())
 
     def val_dataloader(self) -> EVAL_DATALOADERS:
         assert self.val_idx is not None
-        return DataLoader(self.val_set, batch_size=self.batch_size, num_workers=8)
+        return DataLoader(self.val_set, batch_size=self.batch_size, num_workers=os.cpu_count())
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
         assert self.test_idx is not None
         print("Drop Last")
-        return DataLoader(self.test_set, batch_size=self.batch_size, num_workers=8, drop_last=True)
+        return DataLoader(self.test_set, batch_size=self.batch_size, num_workers=os.cpu_count(), drop_last=True)
 
     def predict_dataloader(self) -> EVAL_DATALOADERS:
         assert self.pred_idx is not None
-        return DataLoader(self.pred_set, batch_size=self.batch_size, num_workers=8)
+        return DataLoader(self.pred_set, batch_size=self.batch_size, num_workers=os.cpu_count())
 
     def __len__(self):
         return len(self.df)
@@ -267,7 +268,7 @@ class RasterDataset(pl.LightningDataModule):
         self.dataset = TensorDataset(self.arr)
 
     def predict_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(self.dataset, batch_size=self.batch_size, num_workers=8)
+        return DataLoader(self.dataset, batch_size=self.batch_size, num_workers=os.cpu_count())
 
     def __len__(self) -> int:
         return self.h * self.w
@@ -287,7 +288,18 @@ class IndianaDataset(pl.LightningDataModule):
         self.spectra = pd.read_csv(field_spectra)
         self.spectra["Year"] = self.spectra["Date"].apply(lambda x: int(x[:4]))
         self.spectra.sort_values(["Year", "Feature ID", "Date"], inplace=True)
+
+        mask = self.spectra.groupby(["Year", "Feature ID"])["Date"].transform(lambda x: len(x) == 215)
+        self.spectra = self.spectra[mask].copy()
+
+        self.spectra["Day"] = self.spectra.groupby(["Year", "Feature ID"])["Date"].transform(
+            lambda x: list(range(len(x)))
+        )
         self.spectra.set_index(["Year", "Feature ID"], inplace=True)
+        self.spectra.sort_index(inplace=True)
+        self.index = self.spectra.index.copy().drop_duplicates()
+        self.spectra.set_index("Day", append=True, inplace=True)
+        self.spectra.sort_index(inplace=True)
 
         p = sorted(glob(os.path.join(shp_folder, "Indiana_Fall_Transect_Data_V1_*_closest.shp")))
         self.shapes = pd.concat([
@@ -296,7 +308,7 @@ class IndianaDataset(pl.LightningDataModule):
         self.labels = self.shapes[self.attr].unique()
         self.label_encodings = {x: i for i, x in enumerate(self.labels)}
 
-        assert len(self.shapes.index) == len(self.spectra.index)
+        # assert len(self.shapes.index) == len(self.spectra.index)
 
         self.stair_bands = ["blue", "green", "red", "nir", "swir1", "swir2"]
 
@@ -305,10 +317,10 @@ class IndianaDataset(pl.LightningDataModule):
         self.test_size = self.__len__() - self.train_size - self.val_size
 
         self.train_idx, self.test_idx = train_test_split(
-            self.spectra.index, test_size=self.test_size, train_size=(self.train_size + self.val_size)
+            self.index, test_size=self.test_size, train_size=(self.train_size + self.val_size)
         )
         self.train_idx, self.val_idx = train_test_split(
-            self.spectra.index, train_size=self.train_size, test_size=self.val_size
+            self.index, train_size=self.train_size, test_size=self.val_size
         )
 
         self.train_set, self.val_set, self.test_set = [
@@ -320,19 +332,30 @@ class IndianaDataset(pl.LightningDataModule):
         self.save_hyperparameters()
 
     def train_dataloader(self) -> TRAIN_DATALOADERS:
-        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=8, pin_memory=True)
+        return DataLoader(
+            self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=os.cpu_count(), pin_memory=True
+        )
 
     def val_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(self.val_set, batch_size=self.batch_size, shuffle=False, num_workers=8, pin_memory=True)
+        return DataLoader(
+            self.val_set, batch_size=self.batch_size, shuffle=False, num_workers=os.cpu_count(), pin_memory=True
+        )
 
     def test_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=8, pin_memory=True)
+        return DataLoader(
+            self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=os.cpu_count(), pin_memory=True
+        )
 
     def __len__(self):
-        return len(self.spectra.index)
+        return len(self.index)
 
     def __getitem__(self, idx):
-        spectra = self.spectra[self.spectra.index[idx]][self.stair_bands].to_numpy()
+        if isinstance(idx, pd.MultiIndex):
+            idx_spectra = np.repeat(np.array(idx.to_list()), len(idx))
+            idx_spectra = np.hstack([idx_spectra, np.repeat(np.array(range(215)).reshape(-1, 1), repeats=len(idx))])
+        else:
+            idx_spectra = idx
+        spectra = self.spectra[self.stair_bands].loc[idx_spectra].to_numpy()
         if isinstance(idx, pd.MultiIndex):
             spectra = np.vsplit(spectra, len(idx))
         spectra = torch.from_numpy(spectra).float()
