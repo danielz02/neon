@@ -303,8 +303,9 @@ class IndianaDataset(pl.LightningDataModule):
 
         p = sorted(glob(os.path.join(shp_folder, "Indiana_Fall_Transect_Data_V1_*_closest.shp")))
         self.shapes = pd.concat([
-            geopandas.read_file(x).reset_index().rename({"index": "FID"}, axis=1).set_index(["Year", "FID"]) for x in p
+            geopandas.read_file(x).reset_index().rename({"index": "Feature ID"}, axis=1) for x in p
         ])
+        self.shapes = self.shapes.astype({"Feature ID": int, "Year": int}).set_index(["Year", "Feature ID"])
         self.labels = self.shapes[self.attr].unique()
         self.label_encodings = {x: i for i, x in enumerate(self.labels)}
 
@@ -351,18 +352,21 @@ class IndianaDataset(pl.LightningDataModule):
 
     def __getitem__(self, idx):
         if isinstance(idx, pd.MultiIndex):
-            idx_spectra = np.repeat(np.array(idx.to_list()), len(idx))
-            idx_spectra = np.hstack([idx_spectra, np.repeat(np.array(range(215)).reshape(-1, 1), repeats=len(idx))])
+            idx_spectra = np.array(idx.to_list())
+            idx_spectra = np.repeat(idx_spectra, repeats=215, axis=0)
+            idx_spectra = np.hstack([idx_spectra, np.tile(np.array(range(215)), len(idx)).reshape(-1, 1)]).T
+            idx_spectra = pd.MultiIndex.from_arrays(idx_spectra)
         else:
             idx_spectra = idx
         spectra = self.spectra[self.stair_bands].loc[idx_spectra].to_numpy()
         if isinstance(idx, pd.MultiIndex):
             spectra = np.vsplit(spectra, len(idx))
+            spectra = np.stack(spectra, axis=0)
         spectra = torch.from_numpy(spectra).float()
         if isinstance(idx, pd.MultiIndex):
-            labels = torch.from_numpy(self.shapes[self.attr][idx].replace(self.label_encodings))
+            labels = torch.from_numpy(self.shapes.loc[idx][self.attr].replace(self.label_encodings).to_numpy())
         else:
-            labels = torch.tensor(self.label_encodings[self.shapes[self.attr][idx]])
+            labels = torch.tensor(self.label_encodings[self.shapes[self.attr].loc[idx]])
 
         return spectra, labels
 
