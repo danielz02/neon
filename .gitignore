@@ -981,5 +981,12 @@ _deps
 # Remove previous ipynb_checkpoints
 #   git rm -r .ipynb_checkpoints/
 
+.idea/
 data/
+src/wandb
+src/neon
+src/lightning_logs
+src/sklearn_logs
+figures
+src/lr_find_temp_model.ckpt
 neon.qgz

@@ -1,125 +1,208 @@
-import matplotlib.pyplot as plt
+from __future__ import annotations
+
 import torch
+import wandb
+import os.path
 import argparse
 import numpy as np
-from pytorch_lightning import seed_everything
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
-from pytorch_lightning.loggers import WandbLogger
-from pytorch_lightning.utilities.types import TRAIN_DATALOADERS, EVAL_DATALOADERS
 from torch import nn
+from typing import List, Tuple
 import pytorch_lightning as pl
-from dataset import SpectralDataset
+import matplotlib.pyplot as plt
+from dataset import IndianaDataset
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
-from torch.utils.data import random_split
-from utils import des_scatter_plot
+from pytorch_lightning import seed_everything
+from pytorch_lightning.loggers import WandbLogger
+from utils import des_scatter_plot, WandbImageCallback
+from pytorch_lightning.utilities.types import EPOCH_OUTPUT
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
+from sklearn.metrics import accuracy_score, balanced_accuracy_score, precision_recall_fscore_support
 
 
 class LSTM(pl.LightningModule):
-    def __init__(self, data_path: str, label_name: str, batch_size: int, seq_len: int, num_layers: int = 2, hidden_size: int = 64, bidirectional: bool = False, lr: float = 1e-3):
+    def __init__(
+        self, label_name: str | None, seq_len: int | None, num_layers: int = 2, hidden_size: int = 64,
+        in_features: int = 1, bidirectional: bool = False, lr: float = 1e-3, clf_classes: List[str] = None
+    ):
         super().__init__()
         self.seq_len = seq_len
         self.learning_rate = lr
-        self.data_path = data_path
-        self.batch_size = batch_size
         self.label_name = label_name
+        self.n_features = in_features
+        self.class_names = clf_classes
+        self.fig_val, self.ax_val = plt.subplots()
+        self.fig_test, self.ax_test = plt.subplots()
+        self.mode = "regression" if clf_classes is None else "classification"
 
-        self.dataset = SpectralDataset(
-            path=self.data_path,
-            seq_len=self.seq_len,
-            scale=None,
-            target_name=self.label_name,
-            # transforms=GaussianNoise()
-        )
-        self.train_size, self.val_size = int(len(self.dataset) * 0.6), int(len(self.dataset) * 0.2)
-        self.test_size = len(self.dataset) - self.train_size - self.val_size
-        self.train_set, self.val_set, self.test_set = random_split(
-            self.dataset, [self.train_size, self.val_size, self.test_size]
-        )
+        self.encoder = nn.LSTM(self.n_features, hidden_size, num_layers, bidirectional=bidirectional, batch_first=True)
+        if self.mode == "regression":
+            self.head = nn.Sequential(
+                nn.Linear(hidden_size * seq_len, 64),
+                nn.ReLU(),
+                nn.Linear(64, 1)
+            )
+        else:
+            self.head = nn.Sequential(
+                nn.Linear(hidden_size, 64),
+                nn.ReLU(),
+                nn.Linear(64, len(clf_classes))
+            )
 
-        self.encoder = nn.LSTM(1, hidden_size, num_layers, bidirectional=bidirectional, batch_first=True)
-        self.regressor = nn.Sequential(
-            nn.Linear(hidden_size * seq_len, 64),
-            nn.ReLU(),
-            nn.Linear(64, 1)
-        )
+        self.save_hyperparameters()
 
     def forward(self, x):
         n, *_ = x.shape
         x, hidden = self.encoder(x)
-        x = self.regressor(x.reshape(n, -1))
+        if self.mode == "regression":
+            x = self.head(x.reshape(n, -1))
+        else:
+            x = self.head(x[:, -1, :])
         return x
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(params=model.parameters(), lr=self.learning_rate, weight_decay=1e-2)
+        optimizer = torch.optim.AdamW(
+            params=filter(lambda p: p.requires_grad, self.parameters()),
+            lr=self.learning_rate,
+            weight_decay=1e-2
+        )
         return optimizer
 
-    def train_dataloader(self) -> TRAIN_DATALOADERS:
-        return DataLoader(self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=8)
+    def __common_step(self, batch) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        x, y_true = batch
+        y_pred = self.forward(x)
+        if self.mode == "classification":
+            loss = F.cross_entropy(y_pred, y_true)
+        else:
+            loss = F.mse_loss(y_pred.reshape(-1), y_true.reshape(-1))
 
-    def val_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(self.val_set, batch_size=self.batch_size, num_workers=8)
+        return loss, y_pred, y_true
 
-    def test_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(self.test_set, batch_size=self.batch_size, num_workers=8)
+    def __evaluation(self, y_pred, y_true, stage):
+        assert stage == "train" or stage == "validation" or stage == "test"
+
+        if self.mode == "regression":
+            r2 = np.corrcoef(y_true.detach().cpu().reshape(-1), y_pred.detach().cpu().reshape(-1))[0, 1] ** 2
+            self.log(f"{stage}/r2", r2, prog_bar=True, on_step=True, on_epoch=True)
+            if stage == "validation":
+                self.ax_val.clear()
+                des_scatter_plot(
+                    y_pred=y_pred, y_true=y_true, label_name=self.label_name, save_path=None, ax=self.ax_val
+                )
+            if stage == "test":
+                self.ax_test.clear()
+                des_scatter_plot(
+                    y_pred=y_pred, y_true=y_true, label_name=self.label_name, save_path=None, ax=self.ax_test
+                )
+        else:
+            y_prob = F.softmax(y_pred, dim=1).detach().cpu().numpy()
+            y_pred = y_pred.detach().cpu().numpy().argmax(axis=1)
+            y_true = y_true.detach().cpu().numpy()
+
+            accuracy = accuracy_score(y_pred=y_pred, y_true=y_true)
+            balanced_accuracy = balanced_accuracy_score(y_pred=y_pred, y_true=y_true)
+            # clf_report = classification_report(y_pred=y_pred, y_true=y_true, output_dict=True)
+            precision, recall, f_score, _ = precision_recall_fscore_support(
+                y_pred=y_pred, y_true=y_true, average="weighted"
+            )
+
+            self.log(f"{stage}/fscore", f_score)
+            # self.log(f"{stage}_report", clf_report)
+            self.log(f"{stage}/precision", precision)
+            self.log(f"{stage}/recall", recall)
+            self.log(f"{stage}/accuracy", accuracy)
+            self.log(f"{stage}/accuracy_balanced", balanced_accuracy)
+            self.logger.experiment.log({
+                f"{stage}/cm": wandb.plot.confusion_matrix(probs=y_prob, y_true=y_true, class_names=self.class_names),
+                "global_step": self.global_step
+            })
+
+    def __evaluation_on_epoch_end(self, outputs, stage):
+        y_true = torch.cat([x[1] for x in outputs]).reshape(-1)
+        if self.mode == "classification":
+            y_pred = torch.cat([x[0] for x in outputs]).reshape(-1, len(self.class_names))
+            loss = F.cross_entropy(y_pred, y_true).item()
+        else:
+            y_pred = torch.cat([x[0] for x in outputs]).reshape(-1)
+            loss = F.mse_loss(y_pred, y_true).item()
+
+        self.__evaluation(y_pred, y_true, stage)
+        self.log(f"{stage}/loss", loss)
 
     def training_step(self, train_batch, batch_idx):
-        x, y = train_batch
-        x, hidden = self.encoder(x)
-        y_pred = self.regressor(x.flatten(start_dim=1))
-        loss = F.mse_loss(y_pred.reshape(-1), y.reshape(-1))
-        r2 = np.corrcoef(y.detach().cpu().reshape(-1), y_pred.detach().cpu().reshape(-1))[0, 1] ** 2
-        self.log("train_r2", r2)
-        self.log('train_loss', loss)
-        return loss
+        loss, y_pred, y_true = self.__common_step(train_batch)
+        self.__evaluation(y_pred, y_true, "train")
+        self.log('train/loss', loss, prog_bar=True, on_step=True, on_epoch=True)
+
+        return {
+            "loss": loss,
+            "y_pred": y_pred,
+            "y_true": y_true
+        }
+
+    def training_epoch_end(self, outputs: EPOCH_OUTPUT) -> None:
+        y_pred = torch.cat([x["y_pred"] for x in outputs]).reshape(-1, len(self.class_names))
+        y_true = torch.cat([x["y_true"] for x in outputs]).reshape(-1)
+
+        self.__evaluation(y_pred, y_true, "train")
 
     def validation_step(self, val_batch, batch_idx):
-        x, y = val_batch
-        x, hidden = self.encoder(x)
-        y_pred = self.regressor(x.flatten(start_dim=1))
-        loss = F.mse_loss(y_pred.reshape(-1), y.reshape(-1))
-        r2 = np.corrcoef(y.detach().cpu().reshape(-1), y_pred.detach().cpu().reshape(-1))[0, 1] ** 2
-        self.log('val_loss', loss)
-        self.log("val_r2", r2, on_epoch=True, prog_bar=True)
+        _, y_pred, y_true = self.__common_step(val_batch)
+
+        return y_pred, y_true
+
+    def validation_epoch_end(self, outputs: EPOCH_OUTPUT) -> None:
+        self.__evaluation_on_epoch_end(outputs, "validation")
 
     def test_step(self, test_batch, batch_idx):
-        x, y = test_batch
-        x, hidden = self.encoder(x)
-        y_pred = self.regressor(x.flatten(start_dim=1))
-        loss = F.mse_loss(y_pred.reshape(-1), y.reshape(-1))
-        y = y.detach().cpu().reshape(-1)
-        y_pred = y_pred.detach().cpu().reshape(-1)
-        r2 = np.corrcoef(y, y_pred)[0, 1] ** 2
+        _, y_pred, y_true = self.__common_step(test_batch)
 
-        fig, ax = plt.subplots()
-        des_scatter_plot(y_pred=y_pred, y_true=y, label_name=self.label_name, save_path=None, ax=ax)
-        fig.savefig(f"../figures/{self.__class__.__name__}_{self.label_name}.png", dpi=500)
-        fig.close()
+        return y_pred, y_true
 
-        self.log('test_loss', loss)
-        self.log("test_r2", r2, on_epoch=True, prog_bar=True)
-
-        # wandb.log({"Test Scatter Plot": fig})
+    def test_epoch_end(self, outputs: EPOCH_OUTPUT) -> None:
+        self.__evaluation_on_epoch_end(outputs, "test")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Foliar traits prediction")
-    parser.add_argument("--data_path", type=str)
+    parser = argparse.ArgumentParser(description="Classification/Regression Models")
+    parser.add_argument("--batch-size", type=int, default=1024)
+    parser.add_argument("--data-path", type=str)
     parser.add_argument("--attr", type=str)
+    parser.add_argument("--ckpt", type=str)
     args = parser.parse_args()
 
     seed_everything(100)
+
+    # dataset = SpectralDataset(args.data_path, 12, args.attr, 256, [0.6, 0.2, 0.2])
+    dataset = IndianaDataset(
+        "/home/azureuser/data/Indiana_Transet_Data", "/home/azureuser/data/combined.csv", "Residue", batch_size=512
+    )
+
     # model
-    model = LSTM(seq_len=356, label_name=args.attr, data_path=args.data_path, batch_size=4096)
-    checkpoint_callback = ModelCheckpoint(monitor="val_r2", mode="max", auto_insert_metric_name=True)
-    early_stop_callback = EarlyStopping(monitor="val_r2", min_delta=0.05, patience=10, verbose=True, mode="max")
+    # model = LSTM(seq_len=12, label_name=args.attr)
+    model = LSTM(seq_len=None, label_name=None, in_features=6, clf_classes=dataset.labels)
+    checkpoint_callback = ModelCheckpoint(
+        monitor="validation/accuracy", mode="max",
+        filename=f"{os.path.basename(args.data_path)}-"
+                 f"{args.attr.replace(' ', '')}-{{epoch:02d}}-"
+                 f"{{validation/accuracy:02f}}",
+        auto_insert_metric_name=True
+    )
+    early_stop_callback = EarlyStopping(
+        monitor="validation/accuracy", min_delta=0.005, patience=20, verbose=True, mode="max"
+    )
+    # img_callback = WandbImageCallback()
+    lr_monitor = LearningRateMonitor(logging_interval="step", log_momentum=True)
 
     # training
-    logger = WandbLogger(project="neon", log_model=True)
-    trainer = pl.Trainer(gpus=1, precision=16, limit_train_batches=1.0, auto_lr_find=True, max_epochs=100, logger=logger, deterministic=True, callbacks=[checkpoint_callback, early_stop_callback])
-    lr_finder = trainer.tuner.lr_find(model)
+    logger = WandbLogger(project="indiana", log_model=True)
+    trainer = pl.Trainer(
+        gpus=1, precision=16, limit_train_batches=1.0, auto_lr_find=True, max_epochs=100, logger=logger,
+        deterministic=True, callbacks=[checkpoint_callback, early_stop_callback, lr_monitor]
+    )
+    lr_finder = trainer.tuner.lr_find(model, dataset)
     model.hparams.learning_rate = lr_finder.suggestion()
-    trainer.fit(model)
-    trainer.test(ckpt_path="best")
+    print("Best Learning Rate:", model.hparams.learning_rate)
 
+    trainer.fit(model, dataset)
+    trainer.test(ckpt_path="best", datamodule=dataset)
     print("Best Model Saved:", checkpoint_callback.best_model_path)
