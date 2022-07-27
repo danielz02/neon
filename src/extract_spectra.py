@@ -1,53 +1,49 @@
+import os.path
 import rasterio
 import numpy as np
 import pandas as pd
 from glob import glob
-from pandas.tseries.offsets import DateOffset
+from tqdm import tqdm
+from task_pool import MPITaskPool
 
-df = pd.read_csv("/scratch/sciteam/ILL_bbdv/NEON/data/NEON.DP1.10026.001.cfc_carbonNitrogen.expanded.csv")
-df["collectDate"] = pd.to_datetime(df["collectDate"])
 
-rows = []
-for i in range(len(df)):
-    row = df.loc[i]
-    yymm = row["collectDate"].strftime("%Y-%m")
-    fid = str(row["FID"]).zfill(4)
-    site_id = row["siteID"]
-    p = sorted(glob(
-        "/scratch/sciteam/ILL_bbdv/NEON/DP3.30006.001/{site}/{yymm}/{fid}_*.tif"
-        .format(site=site_id, yymm=yymm, fid=fid)
-    ))
-    if len(p) == 0:
-        yymm = (row["collectDate"] + DateOffset(20)).strftime("%Y-%m")
-        p = sorted(glob(
-            "/scratch/sciteam/ILL_bbdv/NEON/DP3.30006.001/{site}/{yymm}/{fid}_*.tif"
-            .format(site=site_id, yymm=yymm, fid=fid)
-        ))
-    if len(p) == 0:
-        yymm = (row["collectDate"] - DateOffset(20)).strftime("%Y-%m")
-        p = sorted(glob(
-            "/scratch/sciteam/ILL_bbdv/NEON/DP3.30006.001/{site}/{yymm}/{fid}_*.tif"
-            .format(site=site_id, yymm=yymm, fid=fid)
-        ))
-    if len(p) == 0:
-        print("Not Found:", fid, row["plotID"], row["collectDate"].strftime("%Y-%m-%d"))
-    else:
-        print("Found:", fid, row["plotID"], row["collectDate"].strftime("%Y-%m-%d"))
-    for f in p:
-        arrs = []
+def work(folder_path):
+    fs = glob(os.path.join(folder_path, "*.tif"))
+
+    c = None
+    spectra = []
+    meta = {"FID": [], "domainID": [], "siteID": [], "plotID": [], "flightDate": []}
+    for f in tqdm(fs):
+        _, domain_id, site_id, _, yyyyddmm, _, _, ids = os.path.basename(f).replace(".tif", "").split("_")
+        plot_id, fid = ids.split("-")
+
         with rasterio.open(f) as src:
-            arr = src.read()
-            c, h, w = arr.shape
-            arr = arr.reshape(c, -1).T
-            arrs.append(arr)
-        arrs = np.concatenate(arrs, axis=0)
-        df_plot = pd.concat([
-            pd.DataFrame({"UID": [row["UID"]] * len(arrs), "FID": [row["FID"]] * len(arrs), "Date": [yymm] * len(arr)}),
-            pd.DataFrame(arrs, columns=range(c)).reset_index(drop=True)
-        ], axis=1).reindex()
-        rows.append(df_plot)
-rows = pd.concat(rows, axis=0)
-rows.to_csv(
-    "/scratch/sciteam/ILL_bbdv/NEON/data/NEON.DP1.10026.001.cfc_carbonNitrogen.expanded.spectra.csv",
-    index=False
-)
+            c, h, w = src.count, src.height, src.width
+            if not (36 <= h <= 42 and 36 <= w <= 42):
+                continue
+            arr = src.read().astype(np.float32)
+            arr[arr <= 0] = np.nan
+            spec = np.nanmedian(arr, axis=(1, 2)).reshape(1, -1)
+            if np.all(np.isnan(spec)):
+                continue
+            spectra.append(spec)
+            meta["FID"].append(fid)
+            meta["siteID"].append(site_id)
+            meta["domainID"].append(domain_id)
+            meta["flightDate"].append(yyyyddmm)
+            meta["plotID"].append(f"{site_id}_{plot_id}")
+    spectra = np.vstack(spectra)
+
+    df = pd.concat([pd.DataFrame(meta), pd.DataFrame(spectra, columns=range(c))], axis=1)
+    df.to_csv(os.path.join(folder_path, "roi.csv"), index=False)
+    print(os.path.join(folder_path, "roi.csv"))
+
+
+if __name__ == "__main__":
+    exe = MPITaskPool()
+    if exe.is_parent():
+        args = glob("/taiga/illinois/aces_guan/sheng/Airborne/Processed_old/NEON/DP1.30006.001/*/*/ROI/")
+    else:
+        args = None
+    exe.run(args, work, log_freq=1)
+
